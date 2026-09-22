@@ -1,6 +1,6 @@
 # tometo
 
-tometo runs the poteto loop on this machine. Code, judgment, panel, and swarm can all be local models: Ollama, llama.cpp, MLX, or an OpenAI-compatible server at 127.0.0.1.
+tometo runs the poteto loop locally. Code, judgment, panel, and swarm can all be local models: Ollama, llama.cpp, MLX, or an OpenAI-compatible server at 127.0.0.1.
 
 Name the data. Reproduce before you fix. Prove the change on the surface a person uses. Put a stronger model on the judgment, and a fast one on the edit. The parent fans out. Children stop when their task is done.
 
