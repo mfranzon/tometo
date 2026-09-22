@@ -1,0 +1,9 @@
+{
+  "name": "tometo",
+  "version": "0.1.0",
+  "description": "Poteto-style engineering loop for every agent setup. Local CLIs are the default lane.",
+  "author": {
+    "name": "tometo contributors"
+  },
+  "license": "MIT"
+}

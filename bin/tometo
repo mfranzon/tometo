@@ -1,0 +1,604 @@
+#!/usr/bin/env python3
+"""Local runner for tometo. One config, every host."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+LEAF_FILE = ROOT / "agents" / "tometo-agent.md"
+VERSION = 1
+PROMPT_TOKEN = "{prompt}"
+
+HOST_ENV = (
+    ("grok", ("GROK_SESSION_ID", "GROK_AGENT")),
+    ("claude-code", ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")),
+    ("cursor", ("CURSOR_AGENT", "CURSOR_TRACE_ID")),
+    ("codex", ("CODEX_SANDBOX", "CODEX_THREAD_ID")),
+    ("opencode", ("OPENCODE", "OPENCODE_CLIENT")),
+    ("pi", ("PI_CODING_AGENT_DIR",)),
+)
+
+CLI_RUNNERS = ("grok", "claude", "opencode", "codex")
+LOCAL_RUNNERS = ("ollama", "llama-cli", "mlx", "openai")
+RUNNER_BIN = {
+    "grok": "grok",
+    "claude": "claude",
+    "opencode": "opencode",
+    "codex": "codex",
+    "ollama": "ollama",
+    "llama-cli": "llama-cli",
+    "mlx": "mlx_lm.generate",
+}
+FILE_PROMPT_RUNNERS = {"grok", "llama-cli"}
+
+APPROVE_MODE = {
+    "edits": "acceptEdits",
+    "auto": "auto",
+    "all": "bypassPermissions",
+}
+
+EFFORT = {
+    "grok": {"code": "high", "judgment": "xhigh", "panel": "xhigh", "swarm": "high"},
+    "claude": {"code": "high", "judgment": "high", "panel": "high", "swarm": "high"},
+    "opencode": {"code": "high", "judgment": "high", "panel": "high", "swarm": "high"},
+    "codex": {"code": "high", "judgment": "high", "panel": "high", "swarm": "high"},
+}
+
+LINK_HOMES = (
+    ("grok", ".grok", "grok"),
+    ("claude-code", ".claude", "claude"),
+    ("cursor", ".cursor", None),
+    ("codex", ".codex", "codex"),
+    ("agents", ".agents", None),
+)
+
+
+def detect_host() -> str:
+    for host, keys in HOST_ENV:
+        if any(os.environ.get(key) for key in keys):
+            return host
+    return "local"
+
+
+def available_runners() -> list[str]:
+    return [name for name in CLI_RUNNERS if shutil.which(RUNNER_BIN[name])]
+
+
+def role_spec(runner: str, role: str) -> dict:
+    return {"runner": runner, "effort": EFFORT[runner][role]}
+
+
+def ollama_models() -> list[dict]:
+    if shutil.which("ollama") is None:
+        return []
+    try:
+        proc = subprocess.run(["ollama", "list"], text=True, capture_output=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if proc.returncode != 0:
+        return []
+    chosen: dict[str, str] = {}
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 2 or parts[0] == "NAME":
+            continue
+        name, model_id = parts[0], parts[1]
+        previous = chosen.get(model_id)
+        if previous is None or (previous.endswith(":latest") and not name.endswith(":latest")):
+            chosen[model_id] = name
+    return [{"runner": "ollama", "model": name, "effort": "high"} for name in chosen.values()]
+
+
+def default_roles(runners: list[str], local: list[dict] | None = None) -> dict:
+    local = [dict(item) for item in (local or [])]
+    inherit = {"runner": "inherit"}
+    if not runners and not local:
+        return {
+            "code": dict(inherit),
+            "judgment": dict(inherit),
+            "panel": [dict(inherit)],
+            "swarm": dict(inherit),
+        }
+    if not runners:
+        first = dict(local[0])
+        judgment = dict(local[1]) if len(local) > 1 else dict(inherit)
+        return {
+            "code": first,
+            "judgment": judgment,
+            "panel": [dict(item) for item in local],
+            "swarm": dict(first),
+        }
+    code = runners[0]
+    others = [name for name in runners if name != code]
+    judgment = role_spec(others[0], "judgment") if others else (dict(local[0]) if local else dict(inherit))
+    panel = [role_spec(name, "panel") for name in runners]
+    panel.extend(dict(item) for item in local)
+    return {
+        "code": role_spec(code, "code"),
+        "judgment": judgment,
+        "panel": panel,
+        "swarm": role_spec(code, "swarm"),
+    }
+
+
+def runner_problem(spec: dict) -> str | None:
+    runner = spec.get("runner")
+    if runner == "inherit":
+        return None
+    if runner == "openai":
+        if not spec.get("model") or not spec.get("base_url"):
+            return "openai needs model and base_url"
+        return None
+    if runner in LOCAL_RUNNERS and not spec.get("model"):
+        return f"{runner} needs a model"
+    binary = RUNNER_BIN.get(runner or "")
+    if binary is None:
+        return f"unknown runner {runner}"
+    if shutil.which(binary) is None:
+        return f"runner {runner} is not on PATH"
+    return None
+
+
+def config_path(home: Path) -> Path:
+    return home / "config.json"
+
+
+def load_config(home: Path) -> dict:
+    path = config_path(home)
+    if not path.is_file():
+        raise SystemExit(f"no config at {path}. run: tometo setup --yes")
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"{path} is not json: {exc}") from exc
+    if data.get("version") != VERSION:
+        raise SystemExit(f"{path} has version {data.get('version')}, want {VERSION}")
+    return data
+
+
+def leaf_text() -> str:
+    raw = LEAF_FILE.read_text()
+    if raw.startswith("---"):
+        end = raw.find("\n---", 3)
+        if end != -1:
+            raw = raw[end + 4 :]
+    return raw.strip() + "\n\n"
+
+
+def skill_names() -> list[Path]:
+    root = ROOT / "skills"
+    return sorted(path for path in root.iterdir() if (path / "SKILL.md").is_file())
+
+
+def build_argv(runner: str, spec: dict, prompt_token: str, cwd: str, approve: str, role: str) -> list[str]:
+    mode = APPROVE_MODE[approve]
+    model = spec.get("model")
+    effort = spec.get("effort")
+    if runner == "grok":
+        argv = [
+            "grok",
+            "--prompt-file",
+            prompt_token,
+            "--cwd",
+            cwd,
+            "--output-format",
+            "plain",
+            "--no-subagents",
+            "--permission-mode",
+            mode,
+        ]
+        if model:
+            argv += ["-m", model]
+        if effort:
+            argv += ["--effort", effort]
+        return argv
+    if runner == "claude":
+        argv = ["claude", "-p", "--permission-mode", mode, "--output-format", "text"]
+        if approve == "all":
+            argv.append("--allow-dangerously-skip-permissions")
+        if model:
+            argv += ["--model", model]
+        if effort:
+            argv += ["--effort", effort]
+        argv += ["--disallowed-tools", "Agent", prompt_token]
+        return argv
+    if runner == "opencode":
+        argv = ["opencode", "run", "--dir", cwd, "--format", "default"]
+        if model:
+            argv += ["-m", model]
+        if effort:
+            argv += ["--variant", effort]
+        if approve == "all":
+            argv.append("--auto")
+        argv.append(prompt_token)
+        return argv
+    if runner == "codex":
+        argv = ["codex", "exec", "-C", cwd, "-s", "workspace-write"]
+        if model:
+            argv += ["-m", model]
+        if effort:
+            argv += ["-c", f'model_reasoning_effort="{effort}"']
+        if approve == "all":
+            argv.append("--dangerously-bypass-approvals-and-sandbox")
+        argv.append(prompt_token)
+        return argv
+    if runner == "ollama":
+        if not model:
+            raise SystemExit("ollama needs a model")
+        think = {"xhigh": "high", "max": "high", "high": "high", "medium": "medium", "low": "low", "none": "false"}.get(
+            effort or "", ""
+        )
+        argv = ["ollama", "run", model, "--nowordwrap"]
+        if role in ("code", "swarm"):
+            argv += ["--experimental", "--experimental-yolo"]
+        if think:
+            argv += ["--think", think]
+        argv.append(prompt_token)
+        return argv
+    if runner == "llama-cli":
+        if not model:
+            raise SystemExit("llama-cli needs a model")
+        argv = ["llama-cli", "--single-turn", "--simple-io", "--no-display-prompt", "-f", prompt_token]
+        expanded = Path(model).expanduser()
+        if expanded.exists() or model.endswith(".gguf"):
+            argv += ["-m", str(expanded if expanded.exists() else model)]
+        elif "/" in model:
+            argv += ["--hf-repo", model]
+        else:
+            argv += ["-m", model]
+        if effort:
+            level = effort if effort in ("low", "medium", "high") else "high"
+            argv += ["--reasoning-effort", level]
+        return argv
+    if runner == "mlx":
+        if not model:
+            raise SystemExit("mlx needs a model")
+        return ["mlx_lm.generate", "--model", model, "--max-tokens", "2048", "--prompt", prompt_token]
+    if runner == "openai":
+        if not model or not spec.get("base_url"):
+            raise SystemExit("openai needs model and base_url")
+        url = spec["base_url"].rstrip("/") + "/chat/completions"
+        return ["POST", url, model, prompt_token]
+    raise SystemExit(f"unknown runner {runner}")
+
+
+def specs_for(config: dict, role: str, index: int | None) -> list[dict]:
+    roles = config.get("roles") or {}
+    if role not in roles:
+        raise SystemExit(f"no role {role} in config")
+    raw = roles[role]
+    if role == "panel":
+        if not isinstance(raw, list) or not raw:
+            raise SystemExit("panel role must be a non-empty list")
+        if index is None:
+            return list(raw)
+        if index < 0 or index >= len(raw):
+            raise SystemExit(f"panel index {index} is out of range")
+        return [raw[index]]
+    if isinstance(raw, list):
+        raise SystemExit(f"{role} must be a single runner")
+    return [raw]
+
+
+def planned_worktree(home: Path, cwd: Path, role: str, runner: str) -> Path:
+    return home / "worktrees" / cwd.name / f"{role}-{runner}"
+
+
+def add_worktree(home: Path, cwd: Path, role: str, runner: str) -> Path:
+    top = subprocess.run(
+        ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
+        text=True,
+        capture_output=True,
+    )
+    if top.returncode != 0:
+        raise SystemExit(top.stderr.strip() or "cwd is not a git repo")
+    repo = Path(top.stdout.strip())
+    stamp = time.strftime("%Y%m%d%H%M%S")
+    dest = home / "worktrees" / repo.name / f"{role}-{runner}-{stamp}"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    branch = f"tometo/{role}-{runner}-{stamp}"
+    added = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", branch, str(dest), "HEAD"],
+        text=True,
+        capture_output=True,
+    )
+    if added.returncode != 0:
+        raise SystemExit(added.stderr.strip() or "git worktree add failed")
+    return dest
+
+
+def wrapped_prompt(home: Path, prompt_file: Path, role: str, runner: str) -> tuple[Path, str]:
+    text = leaf_text() + prompt_file.read_text()
+    run_dir = home / "runs" / f"{role}-{runner}-{time.strftime('%Y%m%d%H%M%S')}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    path = run_dir / "prompt.md"
+    path.write_text(text)
+    return path, text
+
+
+def one_call(
+    spec: dict,
+    prompt_file: Path,
+    cwd: Path,
+    approve: str,
+    home: Path,
+    dry: bool,
+    worktree: bool,
+    role: str,
+) -> dict:
+    runner = spec.get("runner")
+    if runner == "inherit":
+        return {"runner": "inherit"}
+    problem = runner_problem(spec)
+    if problem:
+        raise SystemExit(problem)
+    if worktree and dry:
+        run_cwd = planned_worktree(home, cwd, role, runner)
+    elif worktree:
+        run_cwd = add_worktree(home, cwd, role, runner)
+    else:
+        run_cwd = cwd
+    if dry:
+        token = PROMPT_TOKEN
+    elif runner in FILE_PROMPT_RUNNERS:
+        path, _ = wrapped_prompt(home, prompt_file, role, runner)
+        token = str(path)
+    else:
+        _, token = wrapped_prompt(home, prompt_file, role, runner)
+    call = {
+        "runner": runner,
+        "argv": build_argv(runner, spec, token, str(run_cwd), approve, role),
+        "cwd": str(run_cwd),
+    }
+    if worktree:
+        call["worktree"] = str(run_cwd)
+    if dry:
+        return call
+    if runner == "openai":
+        try:
+            call["stdout"] = openai_chat(spec["base_url"], spec["model"], token)
+            call["code"] = 0
+        except (OSError, urllib.error.URLError, KeyError, IndexError, json.JSONDecodeError) as exc:
+            call["stdout"] = ""
+            call["stderr"] = str(exc)
+            call["code"] = 1
+        return call
+    proc = subprocess.run(
+        call["argv"],
+        cwd=str(run_cwd),
+        stdin=subprocess.DEVNULL,
+        text=True,
+        capture_output=True,
+    )
+    call["code"] = proc.returncode
+    call["stdout"] = proc.stdout
+    call["stderr"] = proc.stderr
+    return call
+
+
+def openai_chat(base_url: str, model: str, prompt: str) -> str:
+    url = base_url.rstrip("/") + "/chat/completions"
+    body = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}]}).encode()
+    request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=1800) as response:
+        payload = json.loads(response.read().decode())
+    return payload["choices"][0]["message"]["content"]
+
+
+def local_bins() -> dict[str, str]:
+    found = {}
+    for runner in LOCAL_RUNNERS:
+        binary = RUNNER_BIN.get(runner)
+        if binary is None:
+            continue
+        path = shutil.which(binary)
+        if path:
+            found[runner] = path
+    return found
+
+
+def cmd_detect() -> int:
+    found = {}
+    for name in CLI_RUNNERS:
+        path = shutil.which(RUNNER_BIN[name])
+        if path:
+            found[name] = path
+    json.dump(
+        {
+            "host": detect_host(),
+            "runners": list(found),
+            "bin": found,
+            "local_models": ollama_models(),
+            "local_bins": local_bins(),
+        },
+        sys.stdout,
+        indent=2,
+    )
+    sys.stdout.write("\n")
+    return 0
+
+
+def cmd_setup(home: Path, yes: bool) -> int:
+    path = config_path(home)
+    if path.exists() and not yes:
+        raise SystemExit(f"{path} already exists. pass --yes to replace it")
+    home.mkdir(parents=True, exist_ok=True)
+    data = {
+        "version": VERSION,
+        "lane": "local",
+        "host": detect_host(),
+        "approve": "edits",
+        "roles": default_roles(available_runners(), ollama_models()),
+    }
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    print(path)
+    return 0
+
+
+def cmd_doctor(home: Path) -> int:
+    data = load_config(home)
+    print(f"config: {config_path(home)}")
+    print(f"host: {data.get('host')}")
+    print(f"lane: {data.get('lane')}")
+    print(f"approve: {data.get('approve')}")
+    missing = False
+    roles = data.get("roles") or {}
+    for name, raw in roles.items():
+        specs = raw if isinstance(raw, list) else [raw]
+        bits = []
+        for spec in specs:
+            runner = spec.get("runner")
+            if runner == "inherit":
+                bits.append("inherit")
+                continue
+            problem = runner_problem(spec)
+            missing = missing or problem is not None
+            extra = ""
+            if spec.get("model"):
+                extra += f" model={spec['model']}"
+            if spec.get("effort"):
+                extra += f" effort={spec['effort']}"
+            if spec.get("base_url"):
+                extra += f" base_url={spec['base_url']}"
+            label = "endpoint" if runner == "openai" else "bin"
+            bits.append(f"{runner}{extra} {label}={'ok' if problem is None else 'missing'}")
+        print(f"{name}: {', '.join(bits)}")
+    return 1 if missing else 0
+
+
+def cmd_spawn(args: argparse.Namespace) -> int:
+    home = args.home
+    data = load_config(home)
+    lane = data.get("lane", "local")
+    if lane != "local" and not args.allow_cloud:
+        print(f"lane is {lane}. spawn stays on this machine until you pass --allow-cloud", file=sys.stderr)
+        return 3
+    approve = data.get("approve", "edits")
+    if approve not in APPROVE_MODE:
+        raise SystemExit(f"approve must be one of {', '.join(APPROVE_MODE)}")
+    prompt_file = Path(args.prompt_file).resolve()
+    if not prompt_file.is_file():
+        raise SystemExit(f"no prompt file {prompt_file}")
+    cwd = Path(args.cwd).resolve()
+    specs = specs_for(data, args.role, args.index)
+    if all(spec.get("runner") == "inherit" for spec in specs):
+        json.dump({"lane": lane, "calls": [{"runner": "inherit"}]}, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        print("this role stays in the parent session", file=sys.stderr)
+        return 2
+
+    calls = [
+        one_call(spec, prompt_file, cwd, approve, home, args.dry_run, args.worktree, args.role)
+        for spec in specs
+    ]
+    payload = {"lane": lane, "calls": calls}
+    if args.dry_run:
+        json.dump(payload, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return 0
+    for call in calls:
+        header = call.get("runner", "call")
+        print(f"===== {header} =====")
+        sys.stdout.write(call.get("stdout") or "")
+        if call.get("stderr"):
+            print(call["stderr"], file=sys.stderr)
+    codes = [call.get("code", 0) for call in calls if "code" in call]
+    return 0 if codes and all(code == 0 for code in codes) else 1
+
+
+def link_plan(dest_root: Path) -> list[tuple[Path, Path]]:
+    pairs = []
+    skills = skill_names()
+    for _name, folder, binary in LINK_HOMES:
+        marker = dest_root / folder
+        wanted = folder == ".agents" or marker.exists() or (binary is not None and shutil.which(binary))
+        if not wanted:
+            continue
+        for skill in skills:
+            pairs.append((marker / "skills" / skill.name, skill))
+    return pairs
+
+
+def cmd_link(dest_root: Path, dry: bool) -> int:
+    pairs = link_plan(dest_root)
+    for dest, src in pairs:
+        if dry:
+            print(f"link {dest} -> {src}")
+            continue
+        if dest.is_symlink() and dest.resolve() == src.resolve():
+            print(f"ok {dest}")
+            continue
+        if dest.exists():
+            print(f"skip {dest}")
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.symlink_to(src)
+        print(f"linked {dest}")
+    return 0
+
+
+def default_home() -> Path:
+    return Path.home() / ".tometo"
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(prog="tometo")
+    sub = root.add_subparsers(dest="cmd", required=True)
+
+    detect = sub.add_parser("detect")
+    detect.set_defaults(func=lambda args: cmd_detect())
+
+    setup = sub.add_parser("setup")
+    setup.add_argument("--home", type=Path, default=default_home())
+    setup.add_argument("--yes", action="store_true")
+    setup.set_defaults(func=lambda args: cmd_setup(args.home, args.yes))
+
+    doctor = sub.add_parser("doctor")
+    doctor.add_argument("--home", type=Path, default=default_home())
+    doctor.set_defaults(func=lambda args: cmd_doctor(args.home))
+
+    spawn = sub.add_parser("spawn")
+    spawn.add_argument("--home", type=Path, default=default_home())
+    spawn.add_argument("--role", required=True)
+    spawn.add_argument("--prompt-file", required=True)
+    spawn.add_argument("--cwd", default=os.getcwd())
+    spawn.add_argument("--worktree", action="store_true")
+    spawn.add_argument("--dry-run", action="store_true")
+    spawn.add_argument("--allow-cloud", action="store_true")
+    spawn.add_argument("--index", type=int)
+    spawn.set_defaults(func=cmd_spawn)
+
+    link = sub.add_parser("link")
+    link.add_argument("--dest-root", type=Path, default=Path.home())
+    link.add_argument("--dry-run", action="store_true")
+    link.set_defaults(func=lambda args: cmd_link(args.dest_root, args.dry_run))
+
+    root_cmd = sub.add_parser("root")
+    root_cmd.set_defaults(func=lambda args: print(ROOT) or 0)
+    return root
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    code = args.func(args)
+    return int(code or 0)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SystemExit as exc:
+        if isinstance(exc.code, str):
+            print(exc.code, file=sys.stderr)
+            sys.exit(2)
+        raise

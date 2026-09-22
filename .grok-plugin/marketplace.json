@@ -1,0 +1,17 @@
+{
+  "name": "tometo",
+  "description": "Poteto-style engineering loop for every agent setup, including local CLIs.",
+  "owner": {
+    "name": "tometo contributors"
+  },
+  "plugins": [
+    {
+      "name": "tometo",
+      "description": "Poteto-style engineering loop for every agent setup. Local CLIs are the default lane.",
+      "source": {
+        "type": "local",
+        "path": "."
+      }
+    }
+  ]
+}
