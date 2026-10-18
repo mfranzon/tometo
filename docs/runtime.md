@@ -24,7 +24,16 @@ Skills, host files, and `bin/tometo` share this contract. Change it here first.
 }
 ```
 
-`lane` is `local` or `cloud`. Setup writes `local`. `tometo spawn` refuses a cloud lane until the command includes `--allow-cloud`.
+`lane` is `local` or `cloud`. Setup writes `cloud` when any role it assigns is a cloud runner, and `local` otherwise.
+
+`tometo spawn` starts nothing that sends the prompt off this machine until the command includes `--allow-cloud`. That covers a cloud lane and any cloud call on a local lane:
+
+- `grok`, `claude`, `opencode`, `codex`: always cloud. The binary is local, the model is not.
+- `ollama`: cloud when the model tag ends in `cloud`, for example `gpt-oss:120b-cloud`.
+- `openai`: cloud unless `base_url` is `localhost` or a loopback address.
+- `llama-cli`, `mlx`: local. A Hugging Face repo is downloaded, the prompt is not sent.
+
+The refusal exits 3. `--dry-run` never refuses, and each call it prints carries `"cloud": true` or `false`.
 
 `host` is the session that is driving: `grok`, `claude-code`, `cursor`, `codex`, `opencode`, `pi`, or `local`. Spawn does not care. The session reads `hosts/<host>.md` to decide how to start a child.
 
@@ -79,7 +88,11 @@ Use `bin/tometo spawn` when the runner is another CLI, when the role pins a mode
 bin/tometo spawn --role code --prompt-file /tmp/task.md --cwd "$PWD" --worktree
 ```
 
-`--worktree` adds a git worktree under `~/.tometo/worktrees/` and runs the child there. Pass it when the child writes code.
+`--worktree` adds a git worktree under `~/.tometo/worktrees/` and runs the child there, on a branch `tometo/<role>-<runner>-<time>-<id>`. Pass it when the child writes code.
+
+Each call gets `~/.tometo/runs/<role>-<runner>-<time>-<id>/` with `prompt.md`, `stdout.txt`, and `stderr.txt`. stdout streams to the terminal as it arrives. The path is printed on stderr when the child exits. `--timeout SECONDS` kills a child that runs longer.
+
+`claude`, `opencode`, `codex`, `ollama`, and `mlx` read the prompt on stdin. `grok` and `llama-cli` read `prompt.md`.
 
 A panel is one spawn of `--role panel`, which runs every panel entry and prints a section per runner. `--index N` runs a single entry.
 

@@ -16,6 +16,8 @@ The contract is `docs/runtime.md` in this checkout. The checkout is the director
 3. Match one playbook below. Open a todo list whose first items are that file's steps, copied verbatim. A step you skip stays on the list with `skip:` and the reason.
 4. Do the steps. Start children the way the host file says. Review their diffs yourself.
 
+When `bin/tometo spawn` exits 3, the role would send the prompt off this machine. Ask the user before you re-run it with `--allow-cloud`. A yes covers this session only.
+
 ## Playbooks
 
 | task | file |

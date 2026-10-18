@@ -4,14 +4,18 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -40,6 +44,7 @@ RUNNER_BIN = {
     "mlx": "mlx_lm.generate",
 }
 FILE_PROMPT_RUNNERS = {"grok", "llama-cli"}
+STDIN_RUNNERS = {"claude", "opencode", "codex", "ollama", "mlx"}
 
 APPROVE_MODE = {
     "edits": "acceptEdits",
@@ -131,6 +136,24 @@ def default_roles(runners: list[str], local: list[dict] | None = None) -> dict:
     }
 
 
+def is_cloud(spec: dict) -> bool:
+    runner = spec.get("runner")
+    if runner in CLI_RUNNERS:
+        return True
+    if runner == "ollama":
+        # Ollama cloud models carry a cloud tag, e.g. gpt-oss:120b-cloud.
+        return str(spec.get("model", "")).endswith("cloud")
+    if runner == "openai":
+        host = urllib.parse.urlparse(spec.get("base_url", "")).hostname or ""
+        if host == "localhost":
+            return False
+        try:
+            return not ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            return True
+    return False
+
+
 def runner_problem(spec: dict) -> str | None:
     runner = spec.get("runner")
     if runner == "inherit":
@@ -180,7 +203,7 @@ def skill_names() -> list[Path]:
     return sorted(path for path in root.iterdir() if (path / "SKILL.md").is_file())
 
 
-def build_argv(runner: str, spec: dict, prompt_token: str, cwd: str, approve: str, role: str) -> list[str]:
+def build_argv(runner: str, spec: dict, prompt_path: str, cwd: str, approve: str, role: str) -> list[str]:
     mode = APPROVE_MODE[approve]
     model = spec.get("model")
     effort = spec.get("effort")
@@ -188,7 +211,7 @@ def build_argv(runner: str, spec: dict, prompt_token: str, cwd: str, approve: st
         argv = [
             "grok",
             "--prompt-file",
-            prompt_token,
+            prompt_path,
             "--cwd",
             cwd,
             "--output-format",
@@ -210,7 +233,7 @@ def build_argv(runner: str, spec: dict, prompt_token: str, cwd: str, approve: st
             argv += ["--model", model]
         if effort:
             argv += ["--effort", effort]
-        argv += ["--disallowed-tools", "Agent", prompt_token]
+        argv.append("--disallowed-tools=Agent")
         return argv
     if runner == "opencode":
         argv = ["opencode", "run", "--dir", cwd, "--format", "default"]
@@ -220,7 +243,6 @@ def build_argv(runner: str, spec: dict, prompt_token: str, cwd: str, approve: st
             argv += ["--variant", effort]
         if approve == "all":
             argv.append("--auto")
-        argv.append(prompt_token)
         return argv
     if runner == "codex":
         argv = ["codex", "exec", "-C", cwd, "-s", "workspace-write"]
@@ -230,7 +252,7 @@ def build_argv(runner: str, spec: dict, prompt_token: str, cwd: str, approve: st
             argv += ["-c", f'model_reasoning_effort="{effort}"']
         if approve == "all":
             argv.append("--dangerously-bypass-approvals-and-sandbox")
-        argv.append(prompt_token)
+        argv.append("-")
         return argv
     if runner == "ollama":
         if not model:
@@ -242,13 +264,12 @@ def build_argv(runner: str, spec: dict, prompt_token: str, cwd: str, approve: st
         if role in ("code", "swarm"):
             argv += ["--experimental", "--experimental-yolo"]
         if think:
-            argv += ["--think", think]
-        argv.append(prompt_token)
+            argv.append(f"--think={think}")
         return argv
     if runner == "llama-cli":
         if not model:
             raise SystemExit("llama-cli needs a model")
-        argv = ["llama-cli", "--single-turn", "--simple-io", "--no-display-prompt", "-f", prompt_token]
+        argv = ["llama-cli", "--single-turn", "--simple-io", "--no-display-prompt", "-f", prompt_path]
         expanded = Path(model).expanduser()
         if expanded.exists() or model.endswith(".gguf"):
             argv += ["-m", str(expanded if expanded.exists() else model)]
@@ -263,12 +284,12 @@ def build_argv(runner: str, spec: dict, prompt_token: str, cwd: str, approve: st
     if runner == "mlx":
         if not model:
             raise SystemExit("mlx needs a model")
-        return ["mlx_lm.generate", "--model", model, "--max-tokens", "2048", "--prompt", prompt_token]
+        return ["mlx_lm.generate", "--model", model, "--max-tokens", "2048", "--prompt", "-"]
     if runner == "openai":
         if not model or not spec.get("base_url"):
             raise SystemExit("openai needs model and base_url")
         url = spec["base_url"].rstrip("/") + "/chat/completions"
-        return ["POST", url, model, prompt_token]
+        return ["POST", url, model, prompt_path]
     raise SystemExit(f"unknown runner {runner}")
 
 
@@ -290,11 +311,15 @@ def specs_for(config: dict, role: str, index: int | None) -> list[dict]:
     return [raw]
 
 
-def planned_worktree(home: Path, cwd: Path, role: str, runner: str) -> Path:
-    return home / "worktrees" / cwd.name / f"{role}-{runner}"
+def run_name(role: str, runner: str) -> str:
+    return f"{role}-{runner}-{time.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
 
 
-def add_worktree(home: Path, cwd: Path, role: str, runner: str) -> Path:
+def planned_worktree(home: Path, cwd: Path, name: str) -> Path:
+    return home / "worktrees" / cwd.name / name
+
+
+def add_worktree(home: Path, cwd: Path, name: str) -> Path:
     top = subprocess.run(
         ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
         text=True,
@@ -303,10 +328,9 @@ def add_worktree(home: Path, cwd: Path, role: str, runner: str) -> Path:
     if top.returncode != 0:
         raise SystemExit(top.stderr.strip() or "cwd is not a git repo")
     repo = Path(top.stdout.strip())
-    stamp = time.strftime("%Y%m%d%H%M%S")
-    dest = home / "worktrees" / repo.name / f"{role}-{runner}-{stamp}"
+    dest = home / "worktrees" / repo.name / name
     dest.parent.mkdir(parents=True, exist_ok=True)
-    branch = f"tometo/{role}-{runner}-{stamp}"
+    branch = f"tometo/{name}"
     added = subprocess.run(
         ["git", "-C", str(repo), "worktree", "add", "-b", branch, str(dest), "HEAD"],
         text=True,
@@ -317,13 +341,50 @@ def add_worktree(home: Path, cwd: Path, role: str, runner: str) -> Path:
     return dest
 
 
-def wrapped_prompt(home: Path, prompt_file: Path, role: str, runner: str) -> tuple[Path, str]:
+def wrapped_prompt(run_dir: Path, prompt_file: Path) -> tuple[Path, str]:
     text = leaf_text() + prompt_file.read_text()
-    run_dir = home / "runs" / f"{role}-{runner}-{time.strftime('%Y%m%d%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
     path = run_dir / "prompt.md"
     path.write_text(text)
     return path, text
+
+
+def stream(argv: list[str], cwd: Path, text: str | None, run_dir: Path, timeout: float | None) -> int:
+    """Run argv, echo stdout live, and keep stdout and stderr in run_dir."""
+    with open(run_dir / "stdout.txt", "w") as out, open(run_dir / "stderr.txt", "w") as err:
+        proc = subprocess.Popen(
+            argv,
+            cwd=str(cwd),
+            stdin=subprocess.PIPE if text is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=err,
+            text=True,
+        )
+        killed = threading.Event()
+
+        def kill() -> None:
+            killed.set()
+            proc.kill()
+
+        timer = threading.Timer(timeout, kill) if timeout else None
+        if timer:
+            timer.start()
+        if text is not None:
+            try:
+                proc.stdin.write(text)
+                proc.stdin.close()
+            except BrokenPipeError:
+                pass
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            out.write(line)
+        code = proc.wait()
+        if timer:
+            timer.cancel()
+        if killed.is_set():
+            err.write(f"tometo: killed after {timeout}s\n")
+        return code
 
 
 def one_call(
@@ -335,6 +396,7 @@ def one_call(
     dry: bool,
     worktree: bool,
     role: str,
+    timeout: float | None = None,
 ) -> dict:
     runner = spec.get("runner")
     if runner == "inherit":
@@ -342,55 +404,52 @@ def one_call(
     problem = runner_problem(spec)
     if problem:
         raise SystemExit(problem)
+    name = run_name(role, runner)
+    run_dir = home / "runs" / name
     if worktree and dry:
-        run_cwd = planned_worktree(home, cwd, role, runner)
+        run_cwd = planned_worktree(home, cwd, name)
     elif worktree:
-        run_cwd = add_worktree(home, cwd, role, runner)
+        run_cwd = add_worktree(home, cwd, name)
     else:
         run_cwd = cwd
     if dry:
-        token = PROMPT_TOKEN
-    elif runner in FILE_PROMPT_RUNNERS:
-        path, _ = wrapped_prompt(home, prompt_file, role, runner)
-        token = str(path)
+        path, text = Path(PROMPT_TOKEN), PROMPT_TOKEN
     else:
-        _, token = wrapped_prompt(home, prompt_file, role, runner)
+        path, text = wrapped_prompt(run_dir, prompt_file)
     call = {
         "runner": runner,
-        "argv": build_argv(runner, spec, token, str(run_cwd), approve, role),
+        "cloud": is_cloud(spec),
+        "argv": build_argv(runner, spec, str(path), str(run_cwd), approve, role),
         "cwd": str(run_cwd),
     }
+    if runner in STDIN_RUNNERS:
+        call["stdin"] = str(path)
     if worktree:
         call["worktree"] = str(run_cwd)
     if dry:
         return call
+    call["log"] = str(run_dir)
     if runner == "openai":
         try:
-            call["stdout"] = openai_chat(spec["base_url"], spec["model"], token)
+            reply = openai_chat(spec["base_url"], spec["model"], text, timeout or 1800)
             call["code"] = 0
         except (OSError, urllib.error.URLError, KeyError, IndexError, json.JSONDecodeError) as exc:
-            call["stdout"] = ""
-            call["stderr"] = str(exc)
+            reply = ""
+            (run_dir / "stderr.txt").write_text(str(exc) + "\n")
             call["code"] = 1
+        (run_dir / "stdout.txt").write_text(reply)
+        sys.stdout.write(reply)
         return call
-    proc = subprocess.run(
-        call["argv"],
-        cwd=str(run_cwd),
-        stdin=subprocess.DEVNULL,
-        text=True,
-        capture_output=True,
-    )
-    call["code"] = proc.returncode
-    call["stdout"] = proc.stdout
-    call["stderr"] = proc.stderr
+    stdin_text = text if runner in STDIN_RUNNERS else None
+    call["code"] = stream(call["argv"], run_cwd, stdin_text, run_dir, timeout)
     return call
 
 
-def openai_chat(base_url: str, model: str, prompt: str) -> str:
+def openai_chat(base_url: str, model: str, prompt: str, timeout: float) -> str:
     url = base_url.rstrip("/") + "/chat/completions"
     body = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}]}).encode()
     request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=1800) as response:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         payload = json.loads(response.read().decode())
     return payload["choices"][0]["message"]["content"]
 
@@ -433,12 +492,14 @@ def cmd_setup(home: Path, yes: bool) -> int:
     if path.exists() and not yes:
         raise SystemExit(f"{path} already exists. pass --yes to replace it")
     home.mkdir(parents=True, exist_ok=True)
+    roles = default_roles(available_runners(), ollama_models())
+    specs = [spec for raw in roles.values() for spec in (raw if isinstance(raw, list) else [raw])]
     data = {
         "version": VERSION,
-        "lane": "local",
+        "lane": "cloud" if any(is_cloud(spec) for spec in specs) else "local",
         "host": detect_host(),
         "approve": "edits",
-        "roles": default_roles(available_runners(), ollama_models()),
+        "roles": roles,
     }
     path.write_text(json.dumps(data, indent=2) + "\n")
     print(path)
@@ -470,6 +531,8 @@ def cmd_doctor(home: Path) -> int:
                 extra += f" effort={spec['effort']}"
             if spec.get("base_url"):
                 extra += f" base_url={spec['base_url']}"
+            if is_cloud(spec):
+                extra += " cloud"
             label = "endpoint" if runner == "openai" else "bin"
             bits.append(f"{runner}{extra} {label}={'ok' if problem is None else 'missing'}")
         print(f"{name}: {', '.join(bits)}")
@@ -480,9 +543,6 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     home = args.home
     data = load_config(home)
     lane = data.get("lane", "local")
-    if lane != "local" and not args.allow_cloud:
-        print(f"lane is {lane}. spawn stays on this machine until you pass --allow-cloud", file=sys.stderr)
-        return 3
     approve = data.get("approve", "edits")
     if approve not in APPROVE_MODE:
         raise SystemExit(f"approve must be one of {', '.join(APPROVE_MODE)}")
@@ -496,22 +556,27 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         sys.stdout.write("\n")
         print("this role stays in the parent session", file=sys.stderr)
         return 2
+    cloud = sorted({spec["runner"] for spec in specs if is_cloud(spec)})
+    if (lane != "local" or cloud) and not args.allow_cloud and not args.dry_run:
+        what = f"{', '.join(cloud)} would send the prompt off this machine" if cloud else f"lane is {lane}"
+        print(f"{what}. spawn stays on this machine until you pass --allow-cloud", file=sys.stderr)
+        return 3
 
-    calls = [
-        one_call(spec, prompt_file, cwd, approve, home, args.dry_run, args.worktree, args.role)
-        for spec in specs
-    ]
-    payload = {"lane": lane, "calls": calls}
     if args.dry_run:
-        json.dump(payload, sys.stdout, indent=2)
+        calls = [
+            one_call(spec, prompt_file, cwd, approve, home, True, args.worktree, args.role)
+            for spec in specs
+        ]
+        json.dump({"lane": lane, "calls": calls}, sys.stdout, indent=2)
         sys.stdout.write("\n")
         return 0
-    for call in calls:
-        header = call.get("runner", "call")
-        print(f"===== {header} =====")
-        sys.stdout.write(call.get("stdout") or "")
-        if call.get("stderr"):
-            print(call["stderr"], file=sys.stderr)
+    calls = []
+    for spec in specs:
+        print(f"===== {spec.get('runner', 'call')} =====", flush=True)
+        call = one_call(spec, prompt_file, cwd, approve, home, False, args.worktree, args.role, args.timeout)
+        calls.append(call)
+        if call.get("log"):
+            print(f"tometo: {call['runner']} exit={call.get('code')} log={call['log']}", file=sys.stderr)
     codes = [call.get("code", 0) for call in calls if "code" in call]
     return 0 if codes and all(code == 0 for code in codes) else 1
 
@@ -576,6 +641,7 @@ def parser() -> argparse.ArgumentParser:
     spawn.add_argument("--dry-run", action="store_true")
     spawn.add_argument("--allow-cloud", action="store_true")
     spawn.add_argument("--index", type=int)
+    spawn.add_argument("--timeout", type=float, help="kill each child after this many seconds")
     spawn.set_defaults(func=cmd_spawn)
 
     link = sub.add_parser("link")

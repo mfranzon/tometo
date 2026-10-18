@@ -4,7 +4,7 @@ tometo runs the poteto loop locally. Code, judgment, panel, and swarm can all be
 
 Name the data. Reproduce before you fix. Prove the change on the surface a person uses. Put a stronger model on the judgment, and a fast one on the edit. The parent fans out. Children stop when their task is done.
 
-`tometo spawn` stays on this machine until you pass `--allow-cloud`.
+`tometo spawn` stays on this machine until you pass `--allow-cloud`. `grok`, `claude`, `opencode`, and `codex` are cloud models behind a local binary, so they need it too, as do Ollama `-cloud` models and an `openai` `base_url` that is not loopback.
 
 pstack carries that method on Cursor and Grok Bot. See [NOTICE.md](NOTICE.md).
 
@@ -12,7 +12,7 @@ pstack carries that method on Cursor and Grok Bot. See [NOTICE.md](NOTICE.md).
 
 `~/.tometo/config.json` can name a model on every role. This example uses Qwen3.8, the current open 27B weights. [`qwen3.8:27b`](https://ollama.com/library/qwen3.8) is the default 18GB Ollama tag. [`qwen3.8:27b-q8_0`](https://ollama.com/library/qwen3.8:27b-q8_0) is the 30GB quant. [`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) is the llama.cpp repo.
 
-`setup` writes Ollama into code, judgment, and swarm when no `grok`, `claude`, `opencode`, or `codex` binary is on `PATH`. When one of those CLIs is installed, `setup` leaves code and judgment on it and adds each model from `ollama list` to the panel. Paste the file below to pin every role to a local model.
+`setup` writes Ollama into code, judgment, and swarm when no `grok`, `claude`, `opencode`, or `codex` binary is on `PATH`, and the lane is `local`. When one of those CLIs is installed, `setup` puts code and swarm on it, judgment on a second CLI or else the first Ollama model, adds each model from `ollama list` to the panel, and writes lane `cloud`. Paste the file below to pin every role to a local model.
 
 ```json
 {
